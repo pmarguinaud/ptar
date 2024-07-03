@@ -1,0 +1,557 @@
+#!/usr/bin/perl -w
+#
+
+=head1 NAME
+
+ptar (Parallel tar)
+
+=head1 SYNOPSIS
+
+Create an archive :
+
+  $ ptar --nthreads 24 -cvf X.tar A B C ...
+
+Extract files from an archive :
+
+  $ ptar --nthreads 24 -xvf X.tar
+
+=head1 DESCRIPTION
+
+C<ptar> is a parallel (multi-threaded) tar utility. Files to be extracted or
+archived are opened with several threads. This makes it possible to archive
+thousands of small files in less than 10s on a Lustre filesystem.
+
+If a file was created by C<ptar>, then a trailer is appended to the file, so 
+that when data is extracted back, ptar can operate in parallel. This trailer
+should be ignored by other regular tar utilities.
+
+Note that : 
+
+=over 4
+
+=item * either a full archive is created or extracted; it is not possible
+to append to an existing archive, or to extract partial contents.
+
+=item * C<ptar> output cannot be piped, because it is not written sequentially;
+each thread seeks the archive being created and writes archived data at a
+specific location.
+
+=back
+
+=head1 FORMAT
+
+C<ptar> output conforms to the format used before the standard POSIX.1-1988
+was released; this means that the following restrictions hold:
+
+=over 4
+
+=item * full file names should have a length < 100
+
+=item * files to be archived should have a size < 8Gb
+
+=item * file names should be plain 7-bit ASCII
+
+=back
+
+=head1 HISTORY
+
+=over 4
+
+=item * 08/10/2013; Creation.
+
+=back
+
+=head1 AUTHOR
+
+Philippe.Marguinaud@meteo.fr
+
+=cut
+
+use threads;
+use Thread::Queue;
+
+use File::Find;
+use File::stat;
+use File::Spec;
+use File::Path;
+use FileHandle;
+use File::Basename;
+
+use Data::Dumper;
+
+use Fcntl qw (SEEK_SET SEEK_END);
+use POSIX qw (S_IRWXU S_IRWXG S_IRWXO);
+
+use strict;
+
+my $BLANK = chr (0) x 512;
+my $MAGIC = '!!PTAR!!';
+
+# compute checksum of a header
+
+sub checksum
+{
+  my @headr = map { ord ($_) } split (m//o, $_[0]);
+  my $chks = 0;
+  $chks += $_ for (@headr);
+  return $chks;
+}
+
+# write a single file in archive
+
+sub c
+{
+  my %args = @_;
+  my ($opts, $director, $symblink, $hardlink, $link, $st, $fhC, $offset, $c, $pad0, $bsize) = 
+  @args{qw (opts director symblink hardlink link stat fhC offset c pad0 bsize)};
+
+  
+# We use sysseek & syswrite instead of seek & print (too slow)
+  my ($seek_method, $write_method) = ('sysseek', 'syswrite');
+  
+  my $headr = $BLANK;
+
+  $fhC->$seek_method ($offset, SEEK_SET);
+
+  if ($director)
+    {
+      $c .= '/';
+    }
+
+  if ($opts->{v})
+    {
+      print "$c\n";
+    }
+
+  if (length ($c) > 100)
+    {
+      die ("Filename too long: `$c'\n");
+    }
+
+
+  # Pre-POSIX.1-1988 tar header
+
+  substr ($headr,   0, length ($c), $c);
+  substr ($headr, 100,      7, sprintf ("%7.7o", $st->mode () & (S_IRWXU | S_IRWXG | S_IRWXO)));
+  substr ($headr, 108,      7, sprintf ("%7.7o", $st->uid ()));
+  substr ($headr, 116,      7, sprintf ("%7.7o", $st->gid ()));
+  substr ($headr, 136,     11, sprintf ("%11.11o", $st->mtime ()));
+  substr ($headr, 148,      8, ' ' x 8);
+
+
+
+  if ($link)
+    {
+      if (length ($link) > 100)
+        {
+          die ("Link value too long: `$link'\n");
+        }
+
+      substr ($headr, 124, 11, sprintf ("%11.11o", 0));
+
+      if ($symblink)
+        {
+          substr ($headr, 156, 1, '2');
+        }
+      else
+        {
+          substr ($headr, 156, 1, '1');
+        }
+
+      substr ($headr, 157, length ($link), $link);
+    }
+  elsif ($director)
+    {
+      substr ($headr, 124, 11, sprintf ("%11.11o", 0));
+      substr ($headr, 156, 1, '5');
+    }
+  else
+    {
+      substr ($headr, 124, 11, sprintf ("%11.11o", $st->size ()));
+      substr ($headr, 156, 1, '0');
+    }
+
+  # Set checksum in header
+
+  my $chks = &checksum ($headr);
+  substr ($headr, 148, 8, sprintf ("%6.6o", $chks) . chr (0) . ' ');
+
+  $fhC->$write_method ($headr);
+
+  # Dump file contents in archive
+
+  if ((! $link) && (! $director))
+    {
+      (my $fhc = 'FileHandle'->new ("<$c"))
+        or die ("Cannot open `$c' for reading: $!\n");
+      while ($fhc->read (my $buf, $bsize))
+        {
+          $fhC->$write_method ($buf);
+        }
+      $fhc->close ();
+      $fhC->$write_method (substr ($BLANK, 0, $pad0));
+    }
+
+}
+
+# Create tar archive
+
+sub C
+{
+  my $opts = shift;
+
+  my $nthreads = $opts->{'nthreads'};
+  my $bsize    = $opts->{'blocking-factor'} * 4096;
+  
+  # Create nthreads, waiting for incoming files 
+
+  my $q = 'Thread::Queue'->new ();
+
+  my @t;
+  
+  for (1 .. $nthreads)
+    {
+  
+      my $t = 'threads'->create (sub 
+      {
+        my $fhC;
+        while (my $x = $q->dequeue ())
+          {
+            my $C = $x->{C};
+            ($fhC ||= 'FileHandle'->new ("+<$C"))
+              or die ("Cannot open `$C': $!\n");
+            &c (%$x, fhC => $fhC);
+          }
+        $fhC && $fhC->close ();
+        return;
+      });
+  
+      push @t, $t;
+    }
+
+  my $C = shift (@_);
+  
+  if (-f $C)
+    {
+      unlink ($C);
+    }
+  
+  'FileHandle'->new (">$C")
+    or die ("Cannot open `$C' for writing: $!\n");
+  
+
+  my @offset;
+  my $offset = 0;
+  my %link;
+  
+  for my $F (@_)
+    {
+  
+      my $pushf  = sub
+      {
+        my $c = shift;
+        my $st = lstat ($c);
+  
+        my ($dev, $ino) = ($st->dev (), $st->ino ());
+  
+        my $director = -d $c;
+        my $symblink = -l $c;
+        my $hardlink = $link{$dev}{$ino};
+  
+        # Hard links caching in %links
+
+        $link{$dev}{$ino} ||= $c;
+  
+        my $size = $st->size ();
+        my $link;
+  
+        if ($hardlink)
+          {
+            $link = $link{$dev}{$ino};
+          }
+        elsif ($symblink)
+          {
+            $link = readlink ($c);
+          }
+
+        # Compute file size & padding
+  
+        my $pad0 = $size % 512;
+        if ($pad0 > 0)
+          {
+            $pad0 = 512 - $pad0;
+          }
+  
+        #  Record offset
+
+        push @offset, $offset;
+
+        $q->enqueue ({C => $C, c => 'File::Spec'->canonpath ($c), offset => $offset, 
+                      stat => $st, pad0 => $pad0, bsize => $bsize, symblink => $symblink,
+                      hardlink => $hardlink, director => $director, link => $link, 
+                      opts => $opts});
+
+        # Update offset
+  
+        $offset += 512; # header size
+  
+        if (! defined ($link))
+          {
+            $offset += $size + $pad0; # file contents
+          }
+  
+      };
+  
+      # Scan arguments (file & directories)
+
+      if ((-f $F) || (-l $F))
+        {
+          $pushf->($F);
+        }
+      elsif (-d $F)
+        {
+          &find ({wanted => sub 
+          { 
+            my $f = $File::Find::name;
+            $pushf->($f)
+              if ((-f $f) || (-l $f) || (-d $f));
+          }, no_chdir => 1}, $F);
+        }
+  
+    }
+  
+  # Send stop signal
+
+  for (@t)
+    {
+      $q->enqueue (0);
+    }
+  
+  for my $t (@t)
+    {
+      $t->join ();
+    }
+  
+  # Add 2 blank records
+  
+  my $fh = 'FileHandle'->new (">>$C");
+  $fh->print ($BLANK x 2);
+
+  # trailer will be ignored by regular tar command
+  # Q> = 64 bit unsigned integer in big endian order
+
+  $fh->print (pack ('Q>*', @offset, scalar (@offset)) . $MAGIC);
+
+  $fh->close ();
+
+}
+
+sub x
+{
+  my %args = @_;
+  my ($opts, $X, $offset, $fhX, $bsize) = @args{qw (opts X offset fhX bsize)};
+
+  $fhX->seek ($offset, SEEK_SET)
+    or die ("Cannot seek to `$offset' in `$X'\n");
+
+  $fhX->read (my $headr, 512);
+
+  # Decode header
+
+  (my $x = substr ($headr, 0, 100)) =~ s/\x00*$//o;
+  my $mode = oct (substr ($headr, 100, 7)); 
+  my $time = oct (substr ($headr, 136, 11));
+  my $type = substr ($headr, 156, 1);
+  my $size = oct (substr ($headr, 124, 11));
+  my $chk1 = oct (substr ($headr, 148, 8, ' ' x 8));
+  my $chk2 = &checksum ($headr);
+
+  if ($chk1 != $chk2)
+    {
+      die ("Corrupted header at offset `$offset'\n");
+    }
+
+  if ($opts->{v})
+    {
+      print "x $x\n";
+    }
+
+  &mkpath (&dirname ($x));
+
+  my $hardlink = ($type == '1');
+  my $symblink = ($type == '2');
+  my $director = ($type == '5') || ($x =~ m,/$,o);
+  my $link;
+
+  if ($hardlink || $symblink)
+    {
+      ($link = substr ($headr, 157, 100)) =~ s/\x00*$//o;
+    }
+
+  if ($link)
+    {
+       # Defer link creation
+       return ([$symblink, $link, $x]);
+    } 
+  elsif ($director)
+    {
+
+      # Set mode & time
+      chmod ($mode, $x);
+      utime ($time, $time, $x);
+
+    }
+  else
+    {
+      # Write file contents
+      (my $fhx = 'FileHandle'->new (">$x"))
+        or die ("Cannot open `$x' for writing: $!\n");
+      while ($size)
+        {
+          $bsize = $size < $bsize ? $size : $bsize;
+          $size -= $fhX->read (my $buf, $bsize);
+          $fhx->print ($buf);
+        }
+      $fhx->close ();
+
+      # Set mode & time
+      chmod ($mode, $x);
+      utime ($time, $time, $x);
+
+    }
+
+  return ();
+}
+
+# Extract a full archive
+
+sub X
+{
+  my $opts = shift;
+  my $X = shift;
+
+  (my $fhX = 'FileHandle'->new ("<$X"))
+    or die ("Cannot open `$X' for reading\n");
+
+  # Look for magic string
+
+  $fhX->seek (-8, SEEK_END);
+  $fhX->read (my $magic, 8);
+
+
+  # This archive was not created by ptar; 
+  # let regular tar handle it
+  if ($magic ne $MAGIC)
+    {
+      exec ('tar', 'xf' . ($opts->{v} ? 'v' : ''), $X);
+    }
+
+  # Read offsets
+
+  my $pack;
+
+  $fhX->seek (-16, SEEK_END);
+  $fhX->read ($pack, 8);
+  my $noffset = unpack ('Q>', $pack);
+  $fhX->seek (-16 - 8 * $noffset, SEEK_END);
+  $fhX->read ($pack, 8 * $noffset);
+
+  my @offset = unpack ('Q>*', $pack);
+
+  my $nthreads = $opts->{'nthreads'};
+  my $bsize    = $opts->{'blocking-factor'} * 4096;
+
+  # Create MT-queue & nthreads
+  
+  my $q = 'Thread::Queue'->new ();
+  
+  my @t;
+  
+  for (1 .. $nthreads)
+    {
+  
+      my $t = 'threads'->create ({context => 'list'}, sub 
+      {
+        my $fhX;
+        my @links;
+        while (my $x = $q->dequeue ())
+          {
+            my $X = $x->{X};
+            ($fhX ||= 'FileHandle'->new ("<$X"))
+              or die ("Cannot open `$X': $!\n");
+            push @links, &x (%$x, fhX => $fhX);
+          }
+        $fhX && $fhX->close ();
+        return @links;
+      });
+  
+      push @t, $t;
+    }
+  
+  # Feeed the threads
+
+  for my $offset (@offset)
+    {
+      $q->enqueue ({X => $X, offset => $offset, bsize => $bsize, opts => $opts});
+    }
+
+  # Send stop signal
+
+  for (@t)
+    {
+      $q->enqueue (0);
+    }
+  
+  # Get link info
+
+  my @links;
+  for my $t (@t)
+    {
+      push @links, $t->join ();
+    }
+  
+  # Link processing is handled now
+
+  for (@links)
+    {
+      my ($symblink, $link, $x) = @$_;
+      if ($symblink)
+        {
+          symlink ($link, $x);
+        }
+      else
+        {
+          link ($link, $x);
+        }
+    }
+
+}
+
+
+my %opts = (nthreads => 24, 'blocking-factor' => 2000, c => 0, x => 0, f => 0, v => 0);
+
+use Getopt::Long;
+
+&Getopt::Long::Configure ('bundling');
+
+&GetOptions
+(
+  'nthreads=i'        => \$opts{'nthreads'},
+  'blocking-factor=i' => \$opts{'blocking-factor'},
+  'c'                 => \$opts{'c'},
+  'f'                 => \$opts{'f'},
+  'v'                 => \$opts{'v'},
+  'x'                 => \$opts{'x'},
+);
+
+if ($opts{c} && $opts{f})
+  {
+    &C (\%opts, @ARGV);
+  }
+elsif ($opts{x} && $opts{f})
+  {
+    &X (\%opts, @ARGV);
+  }
+
+
+
